@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Document Processing Pipeline - S3 Triggered Step Functions Workflow
+
+Resources:
+
+  ##############################################
+  # IAM Role for Lambda Functions
+  ##############################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DocumentLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutBucketNotificationConfiguration
+                  - states:StartExecution
+                  - textract:DetectDocumentText
+                  - comprehend:DetectSentiment  # Permission for Comprehend Sentiment Analysis
+                  - comprehend:BatchDetectSentiment
+                Resource: "*"
+
+  ##############################################
+  # S3 Bucket
+  ##############################################
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: document-processor-bucket28
+
+  DocumentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${DocumentBucket}/*
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+
+
+  ##############################################
+  # Lambda: Start Step Functions Execution
+  ##############################################
+  StartStepFunctionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StartDocumentPipeline
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref DocumentProcessingStateMachine
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          sfn = boto3.client('stepfunctions')
+
+          def handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+
+                  input_data = {
+                      "bucket": bucket,
+                      "key": key
+                  }
+
+                  sfn.start_execution(
+                      stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                      input=json.dumps(input_data)
+                  )
+
+              return {"status": "Step Function started"}
+
+  ##############################################
+  # Lambda Functions for Pipeline Steps
+  ##############################################
+
+  ExtractMetadataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ExtractMetadataFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              print("Extracting metadata...")
+              event['metadata'] = {
+                  'title': event['key'].split('/')[-1],
+                  'source': event['bucket']
+              }
+              return event
+
+  ExtractTextFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ExtractTextFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              textract = boto3.client('textract', region_name='us-east-1')
+
+              bucket = event['bucket']
+              key = event['key']
+
+              print(f"Running Textract on s3://{bucket}/{key}")
+
+              response = textract.detect_document_text(
+                  Document={'S3Object': {'Bucket': bucket, 'Name': key}}
+              )
+
+              lines = []
+              for block in response.get('Blocks', []):
+                  if block['BlockType'] == 'LINE':
+                      lines.append(block['Text'])
+
+              extracted_text = "\n".join(lines)
+              event['text'] = extracted_text
+              return event
+
+  AnalyzeTextFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AnalyzeTextFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+
+          def handler(event, context):
+              comprehend = boto3.client('comprehend')
+              text = event.get('text', '')
+
+              if len(text) > 5000:
+                  text = text[:5000]
+
+              print("Analyzing with Comprehend...")
+
+              response = comprehend.detect_sentiment(
+                  Text=text,
+                  LanguageCode='en'
+              )
+
+              event['analysis'] = {
+                  'sentiment': response['Sentiment'],
+                  'scores': response['SentimentScore']
+              }
+
+              return event
+
+  StoreResultsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StoreResultsFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              print("Storing results...")
+              input_key = event['key']
+              output_key = f"results/{input_key}.json"
+              bucket = event['bucket']
+
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=output_key,
+                  Body=json.dumps(event, indent=2),
+                  ContentType='application/json'
+              )
+
+              return {
+                  "status": "success",
+                  "result_path": f"s3://{bucket}/{output_key}"
+              }
+
+  ##############################################
+  # Step Functions IAM Role
+  ##############################################
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DocumentStepFunctionExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionInvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ExtractMetadataFunction.Arn
+                  - !GetAtt ExtractTextFunction.Arn
+                  - !GetAtt AnalyzeTextFunction.Arn
+                  - !GetAtt StoreResultsFunction.Arn
+
+  ##############################################
+  # Step Functions State Machine
+  ##############################################
+  DocumentProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: DocumentProcessingPipeline
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString:
+        !Sub |
+          {
+            "StartAt": "ExtractMetadata",
+            "States": {
+              "ExtractMetadata": {
+                "Type": "Task",
+                "Resource": "${ExtractMetadataFunction.Arn}",
+                "Next": "ExtractText"
+              },
+              "ExtractText": {
+                "Type": "Task",
+                "Resource": "${ExtractTextFunction.Arn}",
+                "Next": "AnalyzeText"
+              },
+              "AnalyzeText": {
+                "Type": "Task",
+                "Resource": "${AnalyzeTextFunction.Arn}",
+                "Next": "StoreResults"
+              },
+              "StoreResults": {
+                "Type": "Task",
+                "Resource": "${StoreResultsFunction.Arn}",
+                "End": true
+              }
+            }
+          }
+
+  ##############################################
+  # Lambda Invoke Permission for S3
+  ##############################################
+  StartLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartStepFunctionLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "s3.amazonaws.com"
+      SourceArn: !GetAtt DocumentBucket.Arn
+
+  # ##############################################
+  # # Custom Resource to Set S3 Notification
+  # ##############################################
+  # S3NotificationCustomResourceFunction:
+  #   Type: AWS::Lambda::Function
+  #   Properties:
+  #     FunctionName: RegisterS3Notification
+  #     Handler: index.handler
+  #     Runtime: python3.9
+  #     Role: !GetAtt LambdaExecutionRole.Arn
+  #     Timeout: 60
+  #     Code:
+  #       ZipFile: |
+  #         import boto3
+
+  #         def handler(event, context):
+  #             bucket = event['ResourceProperties']['Bucket']
+  #             lambda_arn = event['ResourceProperties']['LambdaArn']
+
+  #             s3 = boto3.client('s3')
+  #             s3.put_bucket_notification_configuration(
+  #                 Bucket=bucket,
+  #                 NotificationConfiguration={
+  #                     'LambdaFunctionConfigurations': [
+  #                         {
+  #                             'LambdaFunctionArn': lambda_arn,
+  #                             'Events': ['s3:ObjectCreated:*']
+  #                         }
+  #                     ]
+  #                 }
+  #             )
+
+  #             return {
+  #                 'PhysicalResourceId': f"{bucket}-notification",
+  #                 'Data': {'Status': 'Notification configured'}
+  #             }
+
+  # S3NotificationCustomResource:
+  #   Type: Custom::S3Notification
+  #   DependsOn: StartLambdaInvokePermission
+  #   Properties:
+  #     ServiceToken: !GetAtt S3NotificationCustomResourceFunction.Arn
+  #     Bucket: !Ref DocumentBucket
+  #     LambdaArn: !GetAtt StartStepFunctionLambda.Arn
+
+Outputs:
+  UploadBucket:
+    Description: S3 bucket to upload documents
+    Value: !Ref DocumentBucket
+
+  StateMachineURL:
+    Description: View the state machine in AWS Console
+    Value: !Sub "https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${DocumentProcessingStateMachine}"
